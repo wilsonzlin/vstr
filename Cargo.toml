@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "vstr-prepacker",
+  "vstr-zstd",
   "vstr",
 ]
 

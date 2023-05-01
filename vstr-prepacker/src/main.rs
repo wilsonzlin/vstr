@@ -2,8 +2,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::fs::File;
 use std::io::stdin;
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use tracing::info;
@@ -29,43 +28,35 @@ fn main() {
   assert_eq!(cli.delimiter.len(), 1);
   let delim = cli.delimiter.as_bytes()[0] as u8;
 
-  let mut uncompressed_entries = Vec::new();
-  let mut stdin = BufReader::new(stdin());
+  let mut input_raw = Vec::new();
+  stdin().read_to_end(&mut input_raw).unwrap();
+
+  info!(raw_length = input_raw.len(), "reading samples");
   let mut builder = DictionaryBuilder::new();
-  loop {
-    let mut buf = Vec::new();
-    let offset = buf.len();
-    let n = stdin.read_until(delim, &mut buf).unwrap();
-    assert_eq!(offset + n, buf.len());
-    if n == 0 {
-      break;
-    };
-    // If there's no trailing `delim`, then `buf` won't end with it for the last entry.
-    let uncompressed = buf
-      .strip_suffix(&[delim])
-      .unwrap_or(&buf[offset..offset + n]);
+  let mut sample_count = 0;
+  for uncompressed in input_raw.split(|c| *c == delim) {
     builder.add_sample(uncompressed);
-    uncompressed_entries.push(uncompressed.to_vec());
+    sample_count += 1;
   }
-  info!(
-    samples = uncompressed_entries.len(),
-    "finalising dictionary"
-  );
+
+  info!(samples = sample_count, "finalising dictionary");
   let dict_data = builder.finalise();
   let mut dict_data_raw = Vec::new();
   dict_data
     .serialize(&mut rmp_serde::Serializer::new(&mut dict_data_raw))
     .unwrap();
+
   info!(size = dict_data_raw.len(), "writing dictionary");
   File::create(cli.out)
     .unwrap()
     .write_all(&dict_data_raw)
     .unwrap();
+
   let dict = Dictionary::new(dict_data);
   info!("evaluating performance on samples");
   let mut total_uncompressed_len = 0;
   let mut total_compressed_len = 0;
-  for uncompressed in uncompressed_entries.iter() {
+  for uncompressed in input_raw.split(|c| *c == delim) {
     total_uncompressed_len += uncompressed.len();
     total_compressed_len += dict.compress(uncompressed).len();
   }
