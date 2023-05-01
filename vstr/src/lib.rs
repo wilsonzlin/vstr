@@ -554,42 +554,14 @@ impl DictionaryBuilder {
   }
 
   pub fn add_sample(&mut self, uncompressed: &[u8]) {
-    let mut e = uncompressed;
-    loop {
-      // Which regex, if any, matches the longest.
-      let longest_re_match = RE_SET
-        .matches(e)
-        .into_iter()
-        .filter_map(|re_idx| {
-          RE[re_idx].find(e).map(|m| {
-            (
-              RegexPattern::from_usize(re_idx).unwrap(),
-              m.start(),
-              m.end(),
-            )
-          })
-        })
-        // TODO Pick by min compressed length (i.e. compression ratio), not max uncompressed length.
-        .max_by_key(|e| e.2 - e.1);
-      let literal_before_match = match longest_re_match {
-        Some((_, start, _)) => &e[..start],
-        None => e,
-      };
-      if !literal_before_match.is_empty() {
-        // TODO It may be worth including all subseqs, including ones matched by a regex. It may not be worth it for byte freqs though, as it may add too much noise.
-        for &c in literal_before_match {
-          self.stats.byte_freq[c as usize] += 1;
-        }
-        for l in SUBSEQ_LEN_MIN..=SUBSEQ_LEN_MAX {
-          for s in literal_before_match.windows(l) {
-            *self.stats.subseq_freq.get_or_insert_default(s) += 1;
-          }
-        }
-      };
-      let Some((_typ, _start, end)) = longest_re_match else {
-        break;
-      };
-      e = &e[end..];
+    for &c in uncompressed {
+      self.stats.byte_freq[c as usize] += 1;
+    }
+    // We must track all subseqs, not just ones outside of a regex match, as otherwise the Base64 matcher will essentially match everything and significantly reduce the effectiveness of subseqs deduplication.
+    for l in SUBSEQ_LEN_MIN..=SUBSEQ_LEN_MAX {
+      for s in uncompressed.windows(l) {
+        *self.stats.subseq_freq.get_or_insert_default(s) += 1;
+      }
     }
   }
 
