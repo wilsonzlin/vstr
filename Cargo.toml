@@ -3,6 +3,7 @@ members = [
   "vstr-prepacker",
   "vstr-zstd",
   "vstr",
+  "vstrdbg",
 ]
 
 [profile.release]

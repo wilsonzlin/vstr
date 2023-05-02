@@ -18,8 +18,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::min;
 use std::cmp::Reverse;
-use std::io::Write;
+use std::collections::VecDeque;
+use std::fmt::Write as FmtWrite;
+use std::io::Write as IoWrite;
 use std::iter::once;
+use std::str;
 use std::str::from_utf8_unchecked;
 use trie::Trie;
 
@@ -188,6 +191,7 @@ struct Top32Charset {
 }
 
 impl Top32Charset {
+  // TODO Is this slow? It's on a hot path.
   fn get_index_for_byte(&self, b: u8) -> Option<u8> {
     for i in 0..32 {
       if self.idx_to_byte[i] == b {
@@ -238,11 +242,6 @@ impl Top32Charset {
 const SUBSEQ_LEN_MIN: usize = 4;
 const SUBSEQ_LEN_MAX: usize = 24;
 
-struct Stats {
-  byte_freq: [u64; 256],
-  subseq_freq: Trie<u64>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, FromPrimitive)]
 enum RegexPattern {
   // WARNING: These must be in the same order as `RE_PATTERNS`.
@@ -257,7 +256,8 @@ enum RegexPattern {
   UuidUppercase,
 }
 
-// TODO Base 2 integers.
+// TODO Base 2 integers, timestamps.
+// NOTE: These do not match against the smallest/shortest possible valid value, as those aren't worth compressing.
 const RE_PATTERNS: &'static [&'static str] = &[
   // Base64 padded.
   // WARNING: Character before first `=` padding must be correct, and not just another Base64 character, or else our Base64 decoder will panic.
@@ -296,6 +296,57 @@ static RE: Lazy<Vec<Regex>> = Lazy::new(|| {
 pub struct DictionaryData {
   top_subseqs: Vec<Vec<u8>>,
   top32_charset: Top32Charset,
+}
+
+impl DictionaryData {
+  /// Used for debugging. Message format is unspecified and can change at any time.
+  pub fn generate_inspection_message(&self) -> String {
+    let mut out = String::new();
+    out.push_str("Top 32 characters:\n");
+    out.push_str("------------------\n");
+    out.push_str("\n");
+    out.push_str("  ");
+    for i in 0..32 {
+      write!(out, "    {:>2}", i).unwrap();
+    }
+    out.push_str("\n");
+    out.push_str("  ");
+    for _ in 0..32 {
+      out.push_str("    --");
+    }
+    out.push_str("\n");
+    out.push_str("  ");
+    for b in self.top32_charset.idx_to_byte {
+      if is_display_char(b) && b != b' ' {
+        write!(out, "     {}", char::from(b)).unwrap();
+      } else {
+        write!(out, "  \\x{:02x}", b).unwrap();
+      };
+    }
+    out.push_str("\n");
+    out.push_str("\n");
+
+    out.push_str("Top subseqs:\n");
+    out.push_str("----------------\n");
+    out.push_str("\n");
+    for subseq in self.top_subseqs.iter() {
+      match str::from_utf8(&subseq) {
+        Ok(s) => {
+          out.push_str("lit ");
+          out.push_str(s);
+        }
+        Err(_) => {
+          out.push_str("hex ");
+          for c in subseq {
+            write!(out, "{:02x}", c).unwrap();
+          }
+        }
+      };
+      out.push_str("\n");
+    }
+
+    out
+  }
 }
 
 pub struct Dictionary {
@@ -400,6 +451,9 @@ impl Dictionary {
     let mut e = uncompressed;
     loop {
       // Which regex or top subseq, if any, matches the longest.
+      // TODO This is not fully correct:
+      // - Pick by compression ratio, not absolute compression length, since the latter depends on the length of the uncompressed match.
+      // - It's not ideal to simply go with the first match, but it's also not ideal to go with the longest at *any* position ahead, even very far away ones, unless we recursively compress the literal before it.
       let longest_match = RE_SET
         .matches(e)
         .into_iter()
@@ -453,7 +507,7 @@ impl Dictionary {
               }
             }
           };
-          compressed_len
+          ordered_float::NotNan::new(compressed_len as f64 / uncompressed.len() as f64).unwrap()
         });
       let literal_before_match = match longest_match {
         Some((_, start, _)) => &e[..start],
@@ -540,48 +594,75 @@ impl Dictionary {
 }
 
 pub struct DictionaryBuilder {
-  stats: Stats,
+  byte_freq: [u64; 256],
+  subseq_freq: Trie<u64>,
 }
 
 impl DictionaryBuilder {
   pub fn new() -> Self {
     Self {
-      stats: Stats {
-        byte_freq: [0u64; 256],
-        subseq_freq: Trie::new(),
-      },
+      byte_freq: [0u64; 256],
+      subseq_freq: Trie::new(),
     }
   }
 
   pub fn add_sample(&mut self, uncompressed: &[u8]) {
     for &c in uncompressed {
-      self.stats.byte_freq[c as usize] += 1;
+      self.byte_freq[c as usize] += 1;
     }
-    // We must track all subseqs, not just ones outside of a regex match, as otherwise the Base64 matcher will essentially match everything and significantly reduce the effectiveness of subseqs deduplication.
-    for l in SUBSEQ_LEN_MIN..=SUBSEQ_LEN_MAX {
-      for s in uncompressed.windows(l) {
-        *self.stats.subseq_freq.get_or_insert_default(s) += 1;
+    if uncompressed.len() >= SUBSEQ_LEN_MIN {
+      // We must track all subseqs, not just ones outside of a RegexPattern match, as otherwise the Base64 matcher will essentially match everything and significantly reduce the effectiveness of subseqs deduplication.
+      for start_idx in 0..=uncompressed.len() - SUBSEQ_LEN_MIN {
+        self.subseq_freq.update_all_values_in_path(
+          uncompressed[start_idx..min(uncompressed.len(), start_idx + SUBSEQ_LEN_MAX)]
+            .iter()
+            .cloned(),
+          SUBSEQ_LEN_MIN,
+          |subseq, count| {
+            assert!(subseq.len() >= SUBSEQ_LEN_MIN);
+            assert!(subseq.len() <= SUBSEQ_LEN_MAX);
+            *count += 1;
+          },
+        );
       }
-    }
+    };
   }
 
   pub fn finalise(self) -> DictionaryData {
-    // TODO Tune filter count threshold.
-    let top_subseqs = self
-      .stats
+    let mut top_subseqs = Vec::<Vec<u8>>::new();
+    let mut subseqs_by_savings = self
       .subseq_freq
       .iter()
-      .filter(|(_, count)| **count > 1)
-      .map(|(subseq, count)| (subseq, *count))
-      .sorted_unstable_by_key(|(_, count)| Reverse(*count))
-      .map(|(subseq, _count)| subseq)
-      .take(65792)
-      .map(|subseq| subseq.to_vec())
-      .collect_vec();
+      // It's possible for `subseq` to be shorter than SUBSEQ_LEN_MIN due to unused intermediate internal nodes.
+      // TODO Tune filter count threshold.
+      .filter(|(subseq, count)| subseq.len() >= SUBSEQ_LEN_MIN && **count > 1)
+      .map(|(subseq, count)| {
+        let total_savings = subseq.len() * (*count) as usize;
+        (subseq, *count, total_savings)
+      })
+      .sorted_unstable_by_key(|(_, _, total_savings)| Reverse(*total_savings))
+      .map(|(subseq, _, _)| subseq)
+      .collect::<VecDeque<_>>();
+    while top_subseqs.len() < 65792 {
+      let Some(top_subseq) = subseqs_by_savings.pop_front() else {
+        break;
+      };
+
+      // TODO This doesn't handle partial intersections e.g. top_subseq = `cdefg`, other = `abcde`, some key = `abcdefg` (`abcde` should be filtered out as `cdefg` would make it not possible, but it wouldn't be by this code).
+      // TODO Do more analysis on all of the code/algorithms/data structures/logic in this `finalise` function and the `add_sample` function.
+      // TODO This is not technically always optimal, but works reasonably well without exploding the complexity.
+      if top_subseqs
+        .iter()
+        .any(|other| top_subseq.windows(other.len()).any(|w| w == other))
+      {
+        continue;
+      };
+
+      top_subseqs.push(top_subseq);
+    }
 
     // WARNING: Map first, or else the indices aren't actually the byte values.
     let top32_bytes: [u8; 32] = self
-      .stats
       .byte_freq
       .iter()
       .enumerate()

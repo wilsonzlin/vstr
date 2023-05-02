@@ -1,7 +1,6 @@
 use clap::Parser;
 use serde::Serialize;
 use std::fs::File;
-use std::io::stdin;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,13 +11,17 @@ use vstr::DictionaryBuilder;
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Cli {
-  /// Split stdin bytes by this delimiter to get entries.
-  #[arg(short, long)]
+  /// Split sample file data by this delimiter to get samples. Defaults to the LF character.
+  #[arg(short, long, default_value = "\n")]
   delimiter: String,
 
   /// File to write prepacked dictionary to.
   #[arg(short, long)]
   out: PathBuf,
+
+  /// File containing samples to read.
+  #[arg(short, long)]
+  src: PathBuf,
 }
 
 fn main() {
@@ -29,7 +32,10 @@ fn main() {
   let delim = cli.delimiter.as_bytes()[0] as u8;
 
   let mut input_raw = Vec::new();
-  stdin().read_to_end(&mut input_raw).unwrap();
+  File::open(cli.src)
+    .unwrap()
+    .read_to_end(&mut input_raw)
+    .unwrap();
 
   info!(raw_length = input_raw.len(), "reading samples");
   let mut builder = DictionaryBuilder::new();
