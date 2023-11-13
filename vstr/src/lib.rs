@@ -244,53 +244,18 @@ const SUBSEQ_LEN_MAX: usize = 24;
 
 #[derive(Clone, Copy, PartialEq, Eq, FromPrimitive)]
 enum RegexPattern {
-  // WARNING: These must be in the same order as `RE_PATTERNS`.
-  Base64Padded,
-  HexLowercase,
-  HexUppercase,
+  // WARNING: These must be in the same order as `re_groups.push` calls in `Dictionary::new`.
+  TopSubseq,
   IntPosBase10U56,
   IntPosBase10BigUint,
   IntNegBase10U56,
   IntNegBase10BigUint,
   UuidLowercase,
   UuidUppercase,
+  HexLowercase,
+  HexUppercase,
+  Base64Padded,
 }
-
-// TODO Base 2 integers, timestamps.
-// NOTE: These do not match against the smallest/shortest possible valid value, as those aren't worth compressing.
-const RE_PATTERNS: &'static [&'static str] = &[
-  // Base64 padded.
-  // WARNING: Character before first `=` padding must be correct, and not just another Base64 character, or else our Base64 decoder will panic.
-  r"([A-Za-z0-9+/]{4}){2,}([A-Za-z0-9+/][AIQYgow4]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=|[A-Za-z0-9+/]{4})",
-  // Hex lowercase.
-  r"([a-f0-9]{2}){2,}",
-  // Hex uppercase.
-  r"([A-F0-9]{2}){2,}",
-  // Integer, positive, base 10, 56-bits. We don't need to exactly match 2^56, as any value above 2^49 requires 8 bytes using VarU56 anyway, which is the same as VarBigUint (1 byte for var len + 7 bytes for arbitrary size integer).
-  r"[1-9][0-9]{3,15}",
-  // Integer, positive, base 10, BigUint.
-  r"[1-9][0-9]{16,}",
-  // Integer, negative, base 10, 56-bits.
-  r"-[1-9][0-9]{3,15}",
-  // Integer, negative, base 10, BigUint.
-  r"-[1-9][0-9]{16,}",
-  // UUID lowercase.
-  r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-  // UUID uppercase.
-  r"[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}",
-];
-
-static RE_SET: Lazy<RegexSet> = Lazy::new(|| {
-  // We use a RegexSet as we want the longest match, not just the first group that matches (which may not be the longest).
-  RegexSet::new(RE_PATTERNS).unwrap()
-});
-
-static RE: Lazy<Vec<Regex>> = Lazy::new(|| {
-  RE_PATTERNS
-    .iter()
-    .map(|pat| Regex::new(pat).unwrap())
-    .collect()
-});
 
 #[derive(Serialize, Deserialize)]
 pub struct DictionaryData {
@@ -350,19 +315,39 @@ impl DictionaryData {
 }
 
 pub struct Dictionary {
-  top_subseq_matcher: AhoCorasick,
+  re: Regex,
   top_subseqs: Vec<Vec<u8>>,
   top32_charset: Top32Charset,
 }
 
 impl Dictionary {
   pub fn new(data: DictionaryData) -> Self {
-    let top_subseq_matcher = AhoCorasickBuilder::new()
-      .match_kind(MatchKind::LeftmostLongest)
-      .build(data.top_subseqs.iter())
-      .unwrap();
+    // Unfortunately, the `regex` crate doesn't support longest-first alternate group matching, so the only way is to individually match against each Regex and find the longest length. Even then, the "best" choice is actually the one with the highest compression ratio, not the longest uncompressed match length, so we'd have to match against all regexes and perform calculations (i.e. figure out compressed length, then compression ratio) anyway. A RegexSet doesn't help, because it doesn't tell us where the match is, only which regexes matched; additional regex matching is still required.
+    // Therefore, we use one regex, and don't do any calculations, instead using a basic universal "guess" as to which match type would be best, and then build one regex with one alternate capturing group for each match type ordered by preference. This is important for performance, as compression and decompression will be on small strings and very hot paths, and degrading to multiple linear regex scans, branching, calculations, etc. has a significant performance impact. The most optimal answer is only knowable by enumerating all possible layout/decompression choices, which is impossible, so we're always making some best-effort-only choices anyway.
+    // We combine the dynamic subseqs matching into the same regex so we only need to have one regex and one linear matching pass ever; even using another AhoCorasick would require a separate linear pass.
+    let mut re_groups = Vec::<&str>::new();
+    // Priority 1: always use interned subseqs where possible, since the compression ratio range is huge.
+    // `top_subseqs` should already be ordered by popularity, so the regex alternates will be matched preferring popular subseqs first.
+    let re_subreqs = data.top_subseqs.iter().map(|subseq| subseq.iter().map(|b| format!("\\x{:02x}", *b)).join("")).join("|");
+    re_groups.push(&re_subreqs);
+    // TODO Base 2 integers, timestamps.
+    // NOTE: The following regexes do not match against the smallest/shortest possible valid value, as those aren't worth compressing.
+    // Next, we'll prefer integers, even ones in the middle of some Base64 or hex encoding, because the compression ratio is around 2.3.
+    re_groups.push("[1-9][0-9]{3,15}"); // Integer, positive, base 10, 56-bits. We don't need to exactly match 2^56, as any value above 2^49 requires 8 bytes using VarU56 anyway, which is the same as VarBigUint (1 byte for var len + 7 bytes for arbitrary size integer).
+    re_groups.push("[1-9][0-9]{16,}"); // Integer, positive, base 10, BigUint.
+    re_groups.push("-[1-9][0-9]{3,15}"); // Integer, negative, base 10, 56-bits.
+    re_groups.push("-[1-9][0-9]{16,}"); // Integer, negative, base 10, BigUint.
+    // UUIDs.
+    re_groups.push("[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"); // UUID lowercase.
+    re_groups.push("[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}"); // UUID uppercase.
+    // Hex.
+    re_groups.push("(?:[a-f0-9]{2}){2,}"); // Hex lowercase.
+    re_groups.push("(?:[A-F0-9]{2}){2,}"); // Hex uppercase.
+    // Base64.
+    re_groups.push("(?:[A-Za-z0-9+/]{4}){2,}(?:[A-Za-z0-9+/][AIQYgow4]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=|[A-Za-z0-9+/]{4})"); // Base64 padded. WARNING: Character before first `=` padding must be correct, and not just another Base64 character, or else our Base64 decoder will panic.
+
     Self {
-      top_subseq_matcher,
+      re: Regex::new(&re_groups.join("|")).unwrap(),
       top_subseqs: data.top_subseqs,
       top32_charset: data.top32_charset,
     }
@@ -450,10 +435,6 @@ impl Dictionary {
     let mut compressed = Vec::new();
     let mut e = uncompressed;
     loop {
-      // Which regex or top subseq, if any, matches the longest.
-      // TODO This is not fully correct:
-      // - Pick by compression ratio, not absolute compression length, since the latter depends on the length of the uncompressed match.
-      // - It's not ideal to simply go with the first match, but it's also not ideal to go with the longest at *any* position ahead, even very far away ones, unless we recursively compress the literal before it.
       let longest_match = RE_SET
         .matches(e)
         .into_iter()
@@ -509,25 +490,31 @@ impl Dictionary {
           };
           ordered_float::NotNan::new(compressed_len as f64 / uncompressed.len() as f64).unwrap()
         });
-      let literal_before_match = match longest_match {
-        Some((_, start, _)) => &e[..start],
-        None => e,
-      };
-      if !literal_before_match.is_empty() {
-        match self.top32_charset.encode(literal_before_match) {
-          Some(e) => {
-            compressed.push(PartType::Top32Charset as u8);
-            VarU56::compress_value(
-              literal_before_match.len().try_into().unwrap(),
-              &mut compressed,
-            );
-            BufWithVarLen::compress(&e, &mut compressed);
-          }
-          None => {
-            compressed.push(PartType::Literal as u8);
-            BufWithVarLen::compress(literal_before_match, &mut compressed);
-          }
-        };
+      match longest_match {
+        Some((_, start, _)) => {
+          // We've found a match, but there could be more compressable data before the match, so recurse on that part.
+          let before_match = &e[..start];
+          compressed.append(&mut self.compress(before_match));
+        }
+        None => {
+          // We couldn't find any match, so we must handle as literal.
+          if !e.is_empty() {
+            match self.top32_charset.encode(e) {
+              Some(e) => {
+                compressed.push(PartType::Top32Charset as u8);
+                VarU56::compress_value(
+                  e.len().try_into().unwrap(),
+                  &mut compressed,
+                );
+                BufWithVarLen::compress(&e, &mut compressed);
+              }
+              None => {
+                compressed.push(PartType::Literal as u8);
+                BufWithVarLen::compress(e, &mut compressed);
+              }
+            };
+          };
+        }
       };
       let Some((typ, start, end)) = longest_match else {
         break;
@@ -598,6 +585,11 @@ pub struct DictionaryBuilder {
   subseq_freq: Trie<u64>,
 }
 
+static WORD_RE: Lazy<Regex> = Lazy::new(|| {
+  // TODO Keep in sync with SUBSEQ_LEN_MIN and SUBSEQ_LEN_MAX.
+  Regex::new(r"[a-zA-Z0-9]{4,24}").unwrap()
+});
+
 impl DictionaryBuilder {
   pub fn new() -> Self {
     Self {
@@ -610,27 +602,18 @@ impl DictionaryBuilder {
     for &c in uncompressed {
       self.byte_freq[c as usize] += 1;
     }
-    if uncompressed.len() >= SUBSEQ_LEN_MIN {
-      // We must track all subseqs, not just ones outside of a RegexPattern match, as otherwise the Base64 matcher will essentially match everything and significantly reduce the effectiveness of subseqs deduplication.
-      for start_idx in 0..=uncompressed.len() - SUBSEQ_LEN_MIN {
-        self.subseq_freq.update_all_values_in_path(
-          uncompressed[start_idx..min(uncompressed.len(), start_idx + SUBSEQ_LEN_MAX)]
-            .iter()
-            .cloned(),
-          SUBSEQ_LEN_MIN,
-          |subseq, count| {
-            assert!(subseq.len() >= SUBSEQ_LEN_MIN);
-            assert!(subseq.len() <= SUBSEQ_LEN_MAX);
-            *count += 1;
-          },
-        );
-      }
+    // We must track all subseqs, not just ones outside of a RegexPattern match, as otherwise the Base64 matcher will essentially match everything and significantly reduce the effectiveness of subseqs deduplication.
+    // We would love to do a far more sophisticated subseq compression algorithm. However, initial attempts at trying to implement full arbitrary subseq (i.e. any offset and length) deduplication only ended up with extremely inefficient and complex code, and there were still plenty of unhandled cases that made it ineffective. Fundamentally, it seems like it's an extremely complex and possibly intractible problem to try and find the "global optimum"; even brute forcing is hard to code and absurdly slow. Therefore, we'll start with this basic mechanism, and can analyse, improve, adapt, and add "smarts" as we go. This simple delimiter-splitting mechanism should work pretty well, because:
+    // - Most keys are human-friendly, so usually follow a pattern/format of using words or values separated by delimiters, and most characters represent words or values (i.e. delimiters don't really need to be compressed).
+    // - We have a lot of slots in our dictionary, which should cover most non-arbitrary "word" usages, and even inefficient closely-related entries.
+    // - It's extremely simple and fast.
+    for subseq in WORD_RE.find_iter(uncompressed) {
+      *self.subseq_freq.get_or_insert_default(subseq.as_bytes().iter().cloned()) += 1;
     };
   }
 
   pub fn finalise(self) -> DictionaryData {
-    let mut top_subseqs = Vec::<Vec<u8>>::new();
-    let mut subseqs_by_savings = self
+    let top_subseqs = self
       .subseq_freq
       .iter()
       // It's possible for `subseq` to be shorter than SUBSEQ_LEN_MIN due to unused intermediate internal nodes.
@@ -642,24 +625,8 @@ impl DictionaryBuilder {
       })
       .sorted_unstable_by_key(|(_, _, total_savings)| Reverse(*total_savings))
       .map(|(subseq, _, _)| subseq)
-      .collect::<VecDeque<_>>();
-    while top_subseqs.len() < 65792 {
-      let Some(top_subseq) = subseqs_by_savings.pop_front() else {
-        break;
-      };
-
-      // TODO This doesn't handle partial intersections e.g. top_subseq = `cdefg`, other = `abcde`, some key = `abcdefg` (`abcde` should be filtered out as `cdefg` would make it not possible, but it wouldn't be by this code).
-      // TODO Do more analysis on all of the code/algorithms/data structures/logic in this `finalise` function and the `add_sample` function.
-      // TODO This is not technically always optimal, but works reasonably well without exploding the complexity.
-      if top_subseqs
-        .iter()
-        .any(|other| top_subseq.windows(other.len()).any(|w| w == other))
-      {
-        continue;
-      };
-
-      top_subseqs.push(top_subseq);
-    }
+      .take(65792)
+      .collect_vec();
 
     // WARNING: Map first, or else the indices aren't actually the byte values.
     let top32_bytes: [u8; 32] = self
